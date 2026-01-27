@@ -10,7 +10,7 @@ from backend.nlp.entities import extract_entities
 from backend.nlp.bias import classify_bias
 from backend.models.article_model import ArticleDoc, EntitySentiment
 from backend.elasticsearch.es_client import get_es
-from backend.config import ES_INDEX
+from backend.config import INDEX_NAME
 import trafilatura
 import logging
 import re
@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 RSS_FEEDS = [
     "https://feeds.feedburner.com/ndtvnews-top-stories",
+     "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+     "https://www.thehindu.com/feeder/default.rss",
+     "http://feeds.bbci.co.uk/news/rss.xml",
+     "http://rss.cnn.com/rss/cnn_topstories.rss",
+     "https://www.aljazeera.com/xml/rss/all.xml",
+     "https://techcrunch.com/feed/"
 ]
 
 def truncate_text(text: str, max_tokens: int = 800) -> str:
@@ -129,7 +135,7 @@ def extract_title_from_url(url: str) -> str:
         logger.error(f"Error extracting title from URL {url}: {e}")
         return "News Article"
 
-def fetch_feed_entries(limit_per_feed: int = 20) -> List[Dict]:
+def fetch_feed_entries(limit_per_feed: int = 5) -> List[Dict]:
     """Fetch entries from RSS feeds."""
     items = []
     for feed_url in RSS_FEEDS:
@@ -426,7 +432,7 @@ def create_article_doc(url: str, feed_title: str, rss_entry: Dict) -> Optional[A
 
     return article_doc
 
-def ingest_from_feeds(limit_per_feed: int = 20):
+def ingest_from_feeds(limit_per_feed: int = 5):
     """Function to ingest articles from RSS feeds and index them in Elasticsearch."""
     es = get_es()
     feed_entries = fetch_feed_entries(limit_per_feed=limit_per_feed)
@@ -444,7 +450,7 @@ def ingest_from_feeds(limit_per_feed: int = 20):
                 doc_dict = doc.model_dump()
                 doc_dict['url'] = str(doc_dict['url'])
                 
-                result = es.index(index=ES_INDEX, body=doc_dict)
+                result = es.index(index=INDEX_NAME, body=doc_dict)
                 indexed_count += 1
                 logger.info(f"Successfully indexed: '{doc.title}'")
             else:

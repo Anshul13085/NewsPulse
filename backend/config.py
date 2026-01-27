@@ -1,7 +1,7 @@
 import os
 
 ES_HOST = os.getenv("ES_HOST", "http://localhost:9200")
-ES_INDEX = os.getenv("ES_INDEX", "news_articles")  # you already created this
+INDEX_NAME = os.getenv("ES_INDEX", "news_articles")  # you already created this
 DEFAULT_LANG = "en"
 
 # Model names (change later if you want different ones)

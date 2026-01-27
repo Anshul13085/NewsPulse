@@ -13,7 +13,7 @@ from fastapi import FastAPI, Query
 from typing import Optional
 from backend.scrapers.rss_scraper import ingest_from_feeds
 from backend.elasticsearch.es_client import get_es
-from backend.config import ES_INDEX
+from backend.config import INDEX_NAME
 
 app = FastAPI(title="News Analyser API")
 
@@ -36,7 +36,7 @@ def get_mapping():
     """Debug endpoint to check Elasticsearch mapping"""
     es = get_es()
     try:
-        mapping = es.indices.get_mapping(index=ES_INDEX)
+        mapping = es.indices.get_mapping(index=INDEX_NAME)
         return mapping
     except Exception as e:
         return {"error": str(e)}
@@ -46,7 +46,7 @@ def get_sample_doc():
     """Debug endpoint to get a raw sample document"""
     es = get_es()
     try:
-        res = es.search(index=ES_INDEX, body={"query": {"match_all": {}}}, size=1)
+        res = es.search(index=INDEX_NAME, body={"query": {"match_all": {}}}, size=1)
         if res["hits"]["hits"]:
             return {
                 "raw_document": res["hits"]["hits"][0],
@@ -82,8 +82,8 @@ def search_articles(
     es = get_es()
     
     # Check if index exists
-    if not es.indices.exists(index=ES_INDEX):
-        print(f"DEBUG - Index {ES_INDEX} does not exist!")
+    if not es.indices.exists(index=INDEX_NAME):
+        print(f"DEBUG - Index {INDEX_NAME} does not exist!")
         return {"count": 0, "results": []}
     
     must = []
@@ -96,12 +96,21 @@ def search_articles(
     if bias:
         must.append({"term": {"bias_overall": bias}})
 
-    body = {"query": {"bool": {"must": must}}} if must else {"query": {"match_all": {}}}
+    # 1. Define the query logic (same as before)
+    query_logic = {"bool": {"must": must}} if must else {"match_all": {}}
+
+    # 2. Build the full body WITH sorting
+    body = {
+        "query": query_logic,
+        "sort": [
+            { "published_date": { "order": "desc" } }
+        ]
+    }
     
     print(f"DEBUG - Elasticsearch query: {body}")
     
     try:
-        res = es.search(index=ES_INDEX, body=body, size=size)
+        res = es.search(index=INDEX_NAME, body=body, size=size)
         print(f"DEBUG - Elasticsearch response: total hits = {res['hits']['total']['value'] if 'total' in res['hits'] else 'unknown'}")
         
         # ENHANCED DEBUGGING - Check raw Elasticsearch response

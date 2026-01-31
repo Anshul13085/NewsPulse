@@ -1,12 +1,15 @@
 fastapi
 uvicorn
+requests
 feedparser
 newspaper3k
 trafilatura
 beautifulsoup4
 langdetect
 transformers
+torch
+sentencepiece
 spacy
-dateutil
+python-dateutil
 pydantic
 elasticsearch

@@ -1,7 +1,9 @@
 import feedparser
-from newspaper import Article
+from newspaper import Article, Config
 from datetime import datetime
 from typing import List, Dict, Optional
+import hashlib
+import concurrent.futures
 from backend.nlp.language import detect_language
 from backend.nlp.translator import translate_to_english
 from backend.nlp.summarizer import summarize
@@ -11,9 +13,13 @@ from backend.nlp.bias import classify_bias
 from backend.models.article_model import ArticleDoc, EntitySentiment
 from backend.elasticsearch.es_client import get_es
 from backend.config import INDEX_NAME
+from elasticsearch.helpers import bulk
 import trafilatura
 import logging
 import re
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     from bs4 import BeautifulSoup
@@ -24,128 +30,92 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- CONFIGURATION ---
 RSS_FEEDS = [
     "https://feeds.feedburner.com/ndtvnews-top-stories",
-     "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
-     "https://www.thehindu.com/feeder/default.rss",
-     "http://feeds.bbci.co.uk/news/rss.xml",
-     "http://rss.cnn.com/rss/cnn_topstories.rss",
-     "https://www.aljazeera.com/xml/rss/all.xml",
-     "https://techcrunch.com/feed/"
+    "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+    "https://www.thehindu.com/feeder/default.rss",
+    "http://feeds.bbci.co.uk/news/rss.xml",
+    "http://rss.cnn.com/rss/cnn_topstories.rss",
+    "https://www.aljazeera.com/xml/rss/all.xml",
+    "https://techcrunch.com/feed/",
+    "https://economictimes.indiatimes.com/rssfeedstopstories.cms",
+    "https://economictimes.indiatimes.com/rssfeeds/1977021501.cms",
+    "https://www.livemint.com/rss/business",
+    "https://www.livemint.com/rss/markets",
+    "https://www.livemint.com/rss/money",
+    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
+    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",
+    "https://www.wired.com/feed/rss",
+    "https://www.wired.com/feed/category/science/rss",
+    "https://www.theverge.com/rss/index.xml",
+    "https://timesofindia.indiatimes.com/rssfeeds/66997905.cms",
+    "https://feeds.feedburner.com/gadgets360-latest"
 ]
 
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+
+# --- GLOBAL SESSION SETUP (Fixes Connection Pool Warning) ---
+session = requests.Session()
+adapter = HTTPAdapter(
+    pool_connections=20,  # Increase pool size
+    pool_maxsize=20,      # Increase max size to handle parallel threads
+    max_retries=Retry(total=3, backoff_factor=1)
+)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
+session.headers.update({"User-Agent": USER_AGENT})
+
+
+def generate_id(url: str) -> str:
+    """Generates a unique ID for duplicate prevention."""
+    return hashlib.md5(url.encode('utf-8')).hexdigest()
+
 def truncate_text(text: str, max_tokens: int = 800) -> str:
-    """Truncate text to avoid sequence length errors."""
-    if not text:
-        return text
-    
+    if not text: return text
     max_chars = max_tokens * 4
-    if len(text) <= max_chars:
-        return text
-    
+    if len(text) <= max_chars: return text
     truncated = text[:max_chars]
     last_period = truncated.rfind('.')
-    if last_period > max_chars * 0.8:
-        return truncated[:last_period + 1]
-    
+    if last_period > max_chars * 0.8: return truncated[:last_period + 1]
     return truncated
 
 def clean_title(title: str) -> str:
-    """Clean and validate a title."""
-    if not title:
-        return ""
-    
+    if not title: return ""
     title = ' '.join(title.split())
-    title = title.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
-    
-    unwanted_patterns = [
-        r'\s*-\s*[^-]*$',
-        r'^\s*[|\-]\s*',
-        r'\s*[|\-]\s*$',
-    ]
-    
+    unwanted_patterns = [r'\s*-\s*[^-]*$', r'^\s*[|\-]\s*', r'\s*[|\-]\s*$']
     for pattern in unwanted_patterns:
         title = re.sub(pattern, '', title, flags=re.IGNORECASE)
-    
     if len(title) > 200:
         title = title[:200].rsplit(' ', 1)[0] + "..."
-    
     return title.strip()
 
 def is_valid_title(title: str) -> bool:
-    """Check if a title is valid and meaningful."""
-    if not title or len(title.strip()) < 10:
-        return False
-    
+    if not title or len(title.strip()) < 10: return False
     title_lower = title.lower().strip()
-    
-    invalid_titles = [
-        'untitled', 'no title', 'article', 'news', 'page not found',
-        'error', '404', 'access denied', 'forbidden', 'loading'
-    ]
-    
-    for invalid in invalid_titles:
-        if invalid in title_lower:
-            return False
-    
-    if not re.search(r'[a-zA-Z]{3,}', title):
-        return False
-    
+    invalid_titles = ['untitled', 'no title', 'article', 'news', 'page not found', 'error', '404', 'access denied']
+    if any(inv in title_lower for inv in invalid_titles): return False
     return True
 
 def extract_title_from_url(url: str) -> str:
-    """Extract a reasonable title from URL as fallback."""
     try:
         clean_url = url.replace('https://', '').replace('http://', '').replace('www.', '')
         parts = clean_url.split('/')
-        
-        if len(parts) < 2:
-            domain = clean_url.split('?')[0]
-            return f"Article from {domain.replace('.com', '').replace('.org', '').replace('.net', '').title()}"
-        
-        meaningful_parts = []
-        for part in parts[1:]:
-            if not part or len(part) < 4:
-                continue
-                
-            if any(skip in part.lower() for skip in ['index', 'page', 'www', 'news', 'article', 'default']):
-                continue
-                
-            if part.isdigit() or len(part) < 4:
-                continue
-            
-            cleaned = part.replace('-', ' ').replace('_', ' ')
-            cleaned = re.sub(r'\.[a-z]+$', '', cleaned)
-            cleaned = re.sub(r'[^\w\s]', ' ', cleaned)
-            cleaned = ' '.join(cleaned.split())
-            
-            if len(cleaned) > 5:
-                meaningful_parts.append(cleaned)
-        
-        if meaningful_parts:
-            title_part = max(meaningful_parts, key=len)
-            title = ' '.join(word.capitalize() for word in title_part.split())
-            return title
-        
-        domain = clean_url.split('/')[0].split('?')[0]
-        domain_name = domain.replace('.com', '').replace('.org', '').replace('.net', '').replace('.in', '')
-        return f"Article from {domain_name.title()}"
-        
-    except Exception as e:
-        logger.error(f"Error extracting title from URL {url}: {e}")
+        if len(parts) >= 2:
+            meaningful_parts = [p for p in parts[1:] if len(p) > 4 and not any(x in p for x in ['index', 'html'])]
+            if meaningful_parts:
+                title_part = max(meaningful_parts, key=len)
+                return ' '.join(word.capitalize() for word in title_part.replace('-', ' ').replace('_', ' ').split())
+        return "News Article"
+    except:
         return "News Article"
 
-def fetch_feed_entries(limit_per_feed: int = 5) -> List[Dict]:
-    """Fetch entries from RSS feeds."""
+def fetch_feed_entries(limit_per_feed: int = 20) -> List[Dict]:
     items = []
+    # Fetch feeds sequentially is fast enough (network headers only)
     for feed_url in RSS_FEEDS:
         try:
-            logger.info(f"Fetching feed: {feed_url}")
             feed = feedparser.parse(feed_url)
-            
-            if feed.bozo:
-                logger.warning(f"Feed parsing issues for {feed_url}")
-            
             for entry in feed.entries[:limit_per_feed]:
                 items.append({
                     "title": entry.get("title", "").strip(),
@@ -154,271 +124,198 @@ def fetch_feed_entries(limit_per_feed: int = 5) -> List[Dict]:
                     "source": feed.feed.get("title") or feed_url,
                     "description": entry.get("description", "")
                 })
-                
-            logger.info(f"Fetched {len(feed.entries[:limit_per_feed])} entries from {feed_url}")
-                
         except Exception as e:
-            logger.error(f"Error fetching feed {feed_url}: {str(e)}")
-    
+            logger.error(f"Error fetching feed {feed_url}: {e}")
     return items
 
 def extract_title_from_html(downloaded_html: str, url: str) -> Optional[str]:
     """Extract title from HTML using BeautifulSoup."""
     if not BeautifulSoup or not downloaded_html:
         return None
-    
     try:
         soup = BeautifulSoup(downloaded_html, 'html.parser')
-        
         title_selectors = [
-            ('meta[property="og:title"]', 'content'),
-            ('meta[name="twitter:title"]', 'content'),
-            ('meta[property="twitter:title"]', 'content'),
-            ('title', 'text'),
-            ('h1', 'text'),
-            ('.headline', 'text'),
-            ('.title', 'text'),
-            ('.article-title', 'text'),
-            ('.post-title', 'text'),
-            ('[class*="headline"]', 'text'),
-            ('[class*="title"]', 'text'),
+            ('meta[property="og:title"]', 'content'), ('meta[name="twitter:title"]', 'content'),
+            ('meta[property="twitter:title"]', 'content'), ('title', 'text'), ('h1', 'text'),
+            ('.headline', 'text'), ('.title', 'text'), ('.article-title', 'text'),
+            ('.post-title', 'text'), ('[class*="headline"]', 'text'), ('[class*="title"]', 'text'),
         ]
-        
         for selector, attr_type in title_selectors:
             try:
                 elements = soup.select(selector)
-                
                 for element in elements[:3]:
-                    if attr_type == 'content':
-                        title = element.get('content', '').strip()
-                    else:
-                        title = element.get_text(strip=True)
-                    
-                    if title and is_valid_title(title):
-                        cleaned_title = clean_title(title)
-                        return cleaned_title
-                        
-            except Exception:
-                continue
-        
+                    if attr_type == 'content': title = element.get('content', '').strip()
+                    else: title = element.get_text(strip=True)
+                    if title and is_valid_title(title): return clean_title(title)
+            except: continue
         return None
-        
     except Exception as e:
-        logger.error(f"HTML title extraction failed for {url}: {e}")
+        # logger.error(f"HTML title extraction failed for {url}: {e}")
         return None
 
 def extract_title_from_content(text: str) -> Optional[str]:
-    """Try to extract a title from the article content itself."""
-    if not text or len(text) < 50:
-        return None
-    
+    if not text or len(text) < 50: return None
     sentences = re.split(r'[.!?]+', text)
-    
     for sentence in sentences[:5]:
         sentence = sentence.strip()
-        
-        if (15 <= len(sentence) <= 150 and 
-            not sentence.lower().startswith(('the article', 'this article', 'according to', 'in a', 'on ', 'at '))):
-            
+        if (15 <= len(sentence) <= 150 and not sentence.lower().startswith(('the article', 'this article', 'according to', 'in a', 'on ', 'at '))):
             cleaned = clean_title(sentence)
-            if is_valid_title(cleaned):
-                return cleaned
-    
+            if is_valid_title(cleaned): return cleaned
     return None
 
 def download_article(url: str) -> Optional[Dict]:
-    """Download and extract article text using Trafilatura with enhanced title extraction."""
+    # 1. Try Trafilatura with Custom Session (Fixes 403 & Connection Warnings)
     try:
-        downloaded = trafilatura.fetch_url(url)
+        # Use our global session which has pool_maxsize set
+        response = session.get(url, timeout=10)
         
-        if downloaded:
-            extracted_text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
-            
-            if extracted_text and len(extracted_text.strip()) > 100:
+        if response.status_code == 200:
+            text = trafilatura.extract(response.text, include_comments=False, include_tables=False)
+            if text and len(text.strip()) > 100:
                 title = None
-                
-                # Try Trafilatura metadata
                 try:
-                    metadata = trafilatura.extract_metadata(downloaded)
-                    if metadata and hasattr(metadata, 'title') and metadata.title:
-                        potential_title = clean_title(metadata.title)
-                        if is_valid_title(potential_title):
-                            title = potential_title
-                except Exception:
-                    pass
+                    meta = trafilatura.extract_metadata(response.text)
+                    if meta and hasattr(meta, 'title') and meta.title:
+                        pt = clean_title(meta.title)
+                        if is_valid_title(pt): title = pt
+                except: pass
                 
-                # Try HTML extraction
-                if not title:
-                    title = extract_title_from_html(downloaded, url)
+                if not title: title = extract_title_from_html(response.text, url)
+                if not title: title = extract_title_from_content(text)
                 
-                # Try content-based extraction
-                if not title:
-                    title = extract_title_from_content(extracted_text)
-                
-                return {
-                    "title": title,
-                    "text": extracted_text,
-                    "authors": [],
-                    "publish_date": None,
-                    "top_image": None,
-                    "method": "trafilatura"
-                }
-                
+                return {"title": title, "text": text, "method": "trafilatura", "publish_date": None}
     except Exception as e:
-        logger.warning(f"Trafilatura failed for {url}: {str(e)}")
+        # logger.warning(f"Trafilatura failed: {e}") 
+        pass
 
-    # Fallback to Newspaper3k
+    # 2. Fallback to Newspaper3k with Config
     try:
-        art = Article(url, keep_article_html=False)
+        config = Config()
+        config.browser_user_agent = USER_AGENT
+        config.request_timeout = 10
+
+        art = Article(url, config=config, keep_article_html=False)
         art.download()
         art.parse()
-        
         if art.text and len(art.text.strip()) > 100:
             title = None
             if art.title:
-                potential_title = clean_title(art.title)
-                if is_valid_title(potential_title):
-                    title = potential_title
-            
-            return {
-                "title": title,
-                "text": art.text,
-                "authors": art.authors,
-                "publish_date": art.publish_date,
-                "top_image": art.top_image,
-                "method": "newspaper3k"
-            }
-            
-    except Exception as e:
-        logger.warning(f"Newspaper3k also failed for {url}: {str(e)}")
-
-    logger.error(f"All download methods failed for {url}")
+                pt = clean_title(art.title)
+                if is_valid_title(pt): title = pt
+            return {"title": title, "text": art.text, "authors": art.authors, "publish_date": art.publish_date, "top_image": art.top_image, "method": "newspaper3k"}
+    except: pass
+    
     return None
 
 def iso_date(dt) -> Optional[str]:
-    """Convert datetime to ISO string."""
-    if isinstance(dt, datetime):
-        return dt.isoformat()
+    if isinstance(dt, datetime): return dt.isoformat()
     return None
 
 def safe_nlp_operation(operation_name: str, operation_func, *args, **kwargs):
-    """Safely execute NLP operations with proper error logging."""
-    try:
-        result = operation_func(*args, **kwargs)
-        return result
+    try: return operation_func(*args, **kwargs)
     except Exception as e:
         logger.error(f"{operation_name} failed: {str(e)}")
         return None
 
 def validate_and_create_entities(entities_data) -> List[EntitySentiment]:
-    """Safely create EntitySentiment objects with proper validation."""
     entities = []
-    if not entities_data:
-        return entities
-    
+    if not entities_data: return entities
     for e in entities_data:
         try:
             name = e.get("name")
-            if name is None or not isinstance(name, str) or not name.strip():
-                continue
-            
+            if name is None or not isinstance(name, str) or not name.strip(): continue
             entity = EntitySentiment(
-                name=name.strip(),
-                type=e.get("type", "misc"),
-                sentiment=e.get("sentiment", "neutral"),
-                bias=e.get("bias"),
-                score=e.get("score")
+                name=name.strip(), type=e.get("type", "misc"), sentiment=e.get("sentiment", "neutral"),
+                bias=e.get("bias"), score=e.get("score")
             )
             entities.append(entity)
-            
-        except Exception:
-            continue
-    
+        except: continue
     return entities
 
-def create_article_doc(url: str, feed_title: str, rss_entry: Dict) -> Optional[ArticleDoc]:
-    """Create an ArticleDoc with comprehensive title extraction."""
+def process_single_article(entry: Dict) -> Optional[Dict]:
+    """
+    Downloads and processes a SINGLE article. 
+    Designed to run in a parallel thread.
+    """
+    url = entry['link']
+    es = get_es()
+    doc_id = generate_id(url)
+
+    # 1. FAST CHECK: Does it exist?
+    if es.exists(index=INDEX_NAME, id=doc_id):
+        # logger.info(f"⏭️  Skipping existing: {url[:30]}...")
+        return None # Return None to signal "skipped"
+
+    # 2. SLOW PART: Download & NLP
+    # If we are here, it's a NEW article.
+    logger.info(f"⬇️  Downloading: {url[:30]}...")
     raw_article = download_article(url)
-    if not raw_article or not raw_article.get('text'):
-        logger.warning(f"No content extracted for {url}")
+    
+    if not raw_article:
         return None
 
-    text = raw_article['text']
-    text = truncate_text(text, max_tokens=800)
-
-    # Title extraction with priority order
+    text = truncate_text(raw_article['text'])
+    
+    # Title Logic
     final_title = None
-    
     # Priority 1: RSS feed title
-    rss_title = rss_entry.get('title', '').strip()
-    if rss_title and is_valid_title(rss_title):
-        final_title = clean_title(rss_title)
-    
-    # Priority 2: Extracted title from article
+    rss_title = entry.get('title', '').strip()
+    if rss_title and is_valid_title(rss_title): final_title = clean_title(rss_title)
+    # Priority 2: Extracted title
     if not final_title:
-        extracted_title = raw_article.get('title', '').strip() if raw_article.get('title') else ''
-        if extracted_title and is_valid_title(extracted_title):
-            final_title = clean_title(extracted_title)
-    
-    # Priority 3: Content-based title
+        extracted = raw_article.get('title')
+        if extracted and is_valid_title(extracted): final_title = clean_title(extracted)
+    # Priority 3: Content-based
     if not final_title:
         content_title = extract_title_from_content(text)
-        if content_title and is_valid_title(content_title):
-            final_title = content_title
-    
-    # Priority 4: URL-based title
-    if not final_title:
-        final_title = extract_title_from_url(url)
-    
-    # Final validation and cleanup
+        if content_title and is_valid_title(content_title): final_title = content_title
+    # Priority 4: URL-based
+    if not final_title: final_title = extract_title_from_url(url)
     if not final_title or not is_valid_title(final_title):
         final_title = f"Article from {url.split('//')[1].split('/')[0] if '//' in url else 'Unknown Source'}"
 
-    # NLP operations
+    # NLP Pipeline
     lang = safe_nlp_operation("Language detection", detect_language, text) or "en"
-    
     translated_text = None
     if lang != "en":
         translated_result = safe_nlp_operation("Translation", translate_to_english, text)
         if translated_result:
             text = translated_result
             translated_text = translated_result
-
+    
+    # We use safe defaults if NLP fails to save time
     summary = safe_nlp_operation("Summarization", summarize, text)
     entities_data = safe_nlp_operation("Entity extraction", extract_entities, text)
     entities = validate_and_create_entities(entities_data)
 
-    # Bias analysis
     bias_result = safe_nlp_operation("Bias classification", classify_bias, text)
     bias_overall, bias_score = ("neutral", 0.0)
     if bias_result and len(bias_result) >= 2:
         bias_overall = bias_result[0] or "neutral"
         bias_score = bias_result[1] or 0.0
-
-    # Sentiment analysis
+    
     sentiment_result = safe_nlp_operation("Sentiment classification", classify_sentiment, text)
     sentiment_overall, sentiment_score = ("neutral", 0.0)
     if sentiment_result and len(sentiment_result) >= 2:
         sentiment_overall = sentiment_result[0] or "neutral"
         sentiment_score = sentiment_result[1] or 0.0
 
-    # Parse published date
-    published_date = None
-    if raw_article.get('publish_date'):
-        published_date = iso_date(raw_article['publish_date'])
-    elif rss_entry.get('published'):
+    # Format Date
+    pub_date = raw_article.get('publish_date')
+    if not pub_date and entry.get('published'):
         try:
             from dateutil import parser
-            parsed_date = parser.parse(rss_entry['published'])
-            published_date = iso_date(parsed_date)
-        except:
-            pass
-
+            pub_date = parser.parse(entry['published'])
+        except: pass
+    
+    pub_date_str = iso_date(pub_date)
+    
+    # Build the Pydantic Model first to ensure validation
     article_doc = ArticleDoc(
         title=final_title,
         url=url,
-        source_name=feed_title,
-        published_date=published_date,
+        source_name=entry['source'],
+        published_date=pub_date_str,
         language=lang,
         original_text=raw_article['text'][:5000],
         translated_text=translated_text,
@@ -430,41 +327,53 @@ def create_article_doc(url: str, feed_title: str, rss_entry: Dict) -> Optional[A
         entities=entities
     )
 
-    return article_doc
-
-def ingest_from_feeds(limit_per_feed: int = 5):
-    """Function to ingest articles from RSS feeds and index them in Elasticsearch."""
-    es = get_es()
-    feed_entries = fetch_feed_entries(limit_per_feed=limit_per_feed)
-    
-    indexed_count = 0
-    errors = []
-    
-    logger.info(f"Processing {len(feed_entries)} articles...")
-    
-    for i, entry in enumerate(feed_entries):
-        try:
-            doc = create_article_doc(entry['link'], entry['source'], entry)
-            
-            if doc:
-                doc_dict = doc.model_dump()
-                doc_dict['url'] = str(doc_dict['url'])
-                
-                result = es.index(index=INDEX_NAME, body=doc_dict)
-                indexed_count += 1
-                logger.info(f"Successfully indexed: '{doc.title}'")
-            else:
-                logger.warning(f"Failed to create document for {entry.get('link')}")
-                
-        except Exception as e:
-            error_msg = f"Error processing {entry.get('link', 'unknown URL')}: {str(e)}"
-            errors.append(error_msg)
-            logger.error(error_msg)
-    
-    logger.info(f"Ingestion complete - Indexed: {indexed_count}/{len(feed_entries)}, Errors: {len(errors)}")
+    # Return dict for Bulk Indexing
+    doc_dict = article_doc.model_dump()
+    doc_dict['url'] = str(doc_dict['url'])
     
     return {
-        "indexed": indexed_count,
+        "_index": INDEX_NAME,
+        "_id": doc_id,
+        "_source": doc_dict
+    }
+
+def ingest_from_feeds(limit_per_feed: int = 20):
+    """
+    Parallelized Ingestion.
+    """
+    es = get_es()
+    
+    # 1. Fetch all links (Fast)
+    feed_entries = fetch_feed_entries(limit_per_feed)
+    logger.info(f"🌍 Found {len(feed_entries)} articles across all feeds. Starting parallel processing...")
+
+    docs_to_index = []
+    
+    # 2. Parallel Process (The Speed Boost)
+    # We use 5 workers. Going too high might crash your laptop if NLP models are heavy.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all tasks
+        futures = [executor.submit(process_single_article, entry) for entry in feed_entries]
+        
+        # Collect results as they finish
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result()
+                if result:
+                    docs_to_index.append(result)
+                    logger.info(f"✅ Processed: {result['_source']['title'][:30]}...")
+            except Exception as e:
+                logger.error(f"❌ Worker Error: {e}")
+
+    # 3. Bulk Index (Fast Database Insert)
+    if docs_to_index:
+        logger.info(f"💾 Bulk Indexing {len(docs_to_index)} new articles...")
+        success, failed = bulk(es, docs_to_index, stats_only=True)
+        logger.info(f"🎉 Indexed {success} articles successfully.")
+    else:
+        logger.info("💤 No new articles to index.")
+
+    return {
         "total_fetched": len(feed_entries),
-        "errors": errors
+        "new_indexed": len(docs_to_index)
     }

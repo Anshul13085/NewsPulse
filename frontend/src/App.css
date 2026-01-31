@@ -418,3 +418,127 @@ body {
     justify-content: flex-start;
   }
 }
+
+/* --- BUTTON SYSTEM --- */
+.nav-btn {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-decoration: none;
+}
+
+.nav-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+}
+
+.nav-btn:active {
+  transform: translateY(0);
+}
+
+/* Specific Colors */
+.btn-ingest {
+  background-color: #007bff; /* Bright Blue */
+  color: white;
+}
+
+.btn-watchlist {
+  background-color: #f1c40f; /* Warning Yellow/Gold */
+  color: #333;
+}
+
+.btn-logout {
+  background-color: #e74c3c; /* Red */
+  color: white;
+}
+
+.btn-back {
+  background-color: #ecf0f1;
+  color: #333;
+}
+
+/* --- WATCHLIST DASHBOARD CARD --- */
+.watchlist-dashboard {
+  display: flex;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+  overflow: hidden;
+  max-width: 900px;
+  margin: 40px auto;
+  border: 1px solid #eee;
+}
+
+.watchlist-sidebar {
+  background: #f8f9fa;
+  padding: 40px;
+  width: 35%;
+  border-right: 1px solid #eee;
+}
+
+.watchlist-sidebar h3 {
+  margin-top: 0;
+  color: #2c3e50;
+}
+
+.feature-list {
+  list-style: none;
+  padding: 0;
+  margin-top: 20px;
+}
+
+.feature-list li {
+  margin-bottom: 15px;
+  display: flex;
+  gap: 10px;
+  font-size: 14px;
+  color: #555;
+  line-height: 1.4;
+}
+
+.watchlist-main {
+  padding: 40px;
+  flex: 1;
+}
+
+.tag-cloud {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.watch-tag {
+  background: #fff;
+  border: 1px solid #e1e1e1;
+  padding: 8px 16px;
+  border-radius: 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  color: #333;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+}
+
+.watch-tag:hover {
+  border-color: #007bff;
+  color: #007bff;
+}
+
+.remove-tag {
+  color: #999;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.remove-tag:hover {
+  color: #e74c3c;
+}

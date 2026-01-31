@@ -12,3 +12,4 @@ BIAS_MODEL = os.getenv("BIAS_MODEL", "joeddav/xlm-roberta-large-xnli")
 # Summarizer: good English baseline; multilingual options are heavier/slow
 SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "sshleifer/distilbart-cnn-12-6")
 MAX_SUMMARY_TOKENS = int(os.getenv("MAX_SUMMARY_TOKENS", "160"))
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"

@@ -1,29 +1,32 @@
-# backend/nlp/bias.py
 from transformers import pipeline
 import logging
+import torch
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- GLOBAL MODEL LOADING (The Fix) ---
+# We load the model ONCE here, at the top level.
 _bias_classifier = None
 
-def get_bias_classifier():
-    global _bias_classifier
-    if _bias_classifier is None:
-        try:
-            # Using zero-shot classification for bias detection - remove tokenizer_kwargs
-            _bias_classifier = pipeline(
-                "zero-shot-classification",
-                model="joeddav/xlm-roberta-large-xnli",
-                framework="pt"
-                # Remove tokenizer_kwargs - this was causing issues
-            )
-            logger.info("Bias classifier loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load bias classifier: {str(e)}")
-            raise
-    return _bias_classifier
+try:
+    device = 0 if torch.cuda.is_available() else -1
+    logger.info(f"Loading Bias Model on device: {device} (GPU={torch.cuda.is_available()})")
+    
+    # Using zero-shot classification for bias detection
+    _bias_classifier = pipeline(
+        "zero-shot-classification",
+        model="joeddav/xlm-roberta-large-xnli",
+        framework="pt",
+        device=device
+    )
+    logger.info("✅ Bias classifier loaded globally.")
+
+except Exception as e:
+    logger.error(f"❌ Failed to load global bias classifier: {str(e)}")
+    _bias_classifier = None
+
 
 def truncate_text(text: str, max_length: int = 300) -> str:
     """Truncate text for bias analysis"""
@@ -38,7 +41,7 @@ def truncate_text(text: str, max_length: int = 300) -> str:
 
 def classify_bias(text: str) -> tuple[str, float]:
     """
-    Classify political bias of text.
+    Classify political bias of text using the global classifier.
     Returns: (bias_label, confidence_score)
     """
     try:
@@ -46,21 +49,25 @@ def classify_bias(text: str) -> tuple[str, float]:
             logger.warning("Empty text provided for bias analysis")
             return "neutral", 0.0
         
+        if _bias_classifier is None:
+            logger.warning("Bias classifier not loaded")
+            return "neutral", 0.0
+        
         # Truncate text to avoid sequence length issues
         truncated_text = truncate_text(text)
-        logger.info(f"Analyzing bias for text: {truncated_text[:100]}...")
+        # logger.info(f"Analyzing bias for text: {truncated_text[:100]}...")
         
         # Define bias categories
         candidate_labels = ["liberal", "conservative", "neutral", "left-wing", "right-wing"]
         
-        classifier = get_bias_classifier()
-        result = classifier(truncated_text, candidate_labels)
+        # Run inference
+        result = _bias_classifier(truncated_text, candidate_labels)
         
         if result and 'labels' in result and 'scores' in result:
             top_label = result['labels'][0]
             top_score = result['scores'][0]
             
-            logger.info(f"Raw bias result: {top_label} ({top_score:.3f})")
+            # logger.info(f"Raw bias result: {top_label} ({top_score:.3f})")
             
             # Normalize bias labels
             if top_label in ['liberal', 'left-wing']:
@@ -70,7 +77,7 @@ def classify_bias(text: str) -> tuple[str, float]:
             else:
                 bias = 'neutral'
             
-            logger.info(f"Bias classified: {bias} (score: {top_score:.3f})")
+            # logger.info(f"Bias classified: {bias} (score: {top_score:.3f})")
             return bias, float(top_score)
         
         logger.warning("No result from bias classifier")
